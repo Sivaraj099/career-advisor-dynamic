@@ -1,125 +1,144 @@
-import json
 import streamlit as st
-import google.generativeai as genai
+import json, os
+from utils.supabase_client import supabase
+from utils.ui_helpers import show_loading_quotes, stop_loading_quotes
+from google import generativeai as genai
 
-
-
-# ---- Setup ----
-genai.configure(api_key="AIzaSyB_NDGAwjqsq5TcEznWv7Jip0N-ML3rXnQ") 
+# --- Configure Gemini ---
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel("models/gemini-2.5-flash")
 
+# --- Session setup ---
+if "user" not in st.session_state:
+    st.session_state["user"] = {"id": None, "email": "anonymous@demo.app"}
 
-st.title("🧪 Mock Interview (v1 — typed answers)")
+st.title("🧠 AI Mock Interview Assistant")
 
-# ---- Question bank (starter) ----
-QUESTION_BANK = {
-    "Software Engineer": [
-        "Explain the difference between a process and a thread.",
-        "What is a race condition? How do you prevent it?",
-        "How does a hash map work under the hood?",
-        "Describe SOLID principles briefly.",
-        "What happens when you type a URL in the browser and hit Enter?"
-    ],
-    "Data Analyst": [
-        "How would you handle missing data?",
-        "Explain the difference between inner and left joins.",
-        "When would you use a median instead of a mean?",
-        "What is a p-value in hypothesis testing?",
-        "How do you detect outliers?"
-    ],
-    "ML Engineer": [
-        "Bias vs variance — explain with examples.",
-        "What is regularization and why is it useful?",
-        "How do you evaluate an imbalanced classifier?",
-        "Explain gradient descent and learning rate.",
-        "What is overfitting? How do you prevent it?"
-    ],
-    "DevOps Engineer": [
-        "Blue/green vs rolling deployments — differences?",
-        "What is IaC and why use it?",
-        "Explain CI vs CD with examples.",
-        "How do you design observability for a microservice?",
-        "What is a container vs a VM?"
-    ]
-}
+resume = st.session_state.get("current_resume")
+if not resume:
+    st.info("⚠️ Please upload your resume first on Career Advisor page.")
+    st.stop()
 
-# ---- UI ----
-role = st.selectbox("Choose your role", list(QUESTION_BANK.keys()))
-question = st.selectbox("Pick a question", QUESTION_BANK[role])
-answer = st.text_area("Your answer (2–6 sentences recommended):")
-
-if st.button("Evaluate"):
-    if not answer.strip():
-        st.warning("Write an answer first 🙂")
-        st.stop()
-
-    with st.spinner("Scoring your answer..."):
-        prompt = f"""
-You are an interview evaluator. Score the candidate's answer based on these rubrics:
-
-- Technical (0–10): Accuracy, correctness, and relevance of the content.
-- English (0–10): Grammar, fluency, clarity of expression.
-- Confidence (0–10): Structured answer, direct tone, minimal hesitation words.
-
-Return STRICT JSON only with this schema:
-{{
-  "technical": int,
-  "english": int,
-  "confidence": int,
-  "feedback": string,
-  "improvement_plan": string
-}}
-
-Question: {question}
-Answer: {answer}
-"""
-
-        resp = model.generate_content(prompt)
-        raw = resp.text
-
-    # Try to parse JSON robustly
+# --- Generate Questions ---
+if st.button("🎯 Generate Interview Questions"):
+    stop_flag, t, ph, spinner = show_loading_quotes("🤖 Generating custom interview questions...")
     try:
-        result = json.loads(raw)
-    except Exception:
+        prompt = f"""
+        Based on this resume:
+        {json.dumps(resume, indent=2)}
+
+        Create 8 interview questions:
+        - 4 Behavioral (communication, teamwork, problem-solving)
+        - 4 Technical (related to Python, Power BI, Excel, SQL, Pandas, DAX, Azure)
+        Return strict JSON array:
+        [
+          "Behavioral: ...",
+          "Technical: ..."
+        ]
+        """
+        resp = model.generate_content(prompt)
+        raw = resp.text.strip()
+
+        if raw.startswith("```"):
+            raw = raw.replace("```json", "").replace("```", "").strip()
+
         try:
-            start = raw.index("{")
-            end = raw.rindex("}") + 1
-            result = json.loads(raw[start:end])
-        except Exception:
-            st.error("I couldn't parse the scoring JSON. Here's the raw response:")
-            st.code(raw)
+            questions = json.loads(raw)
+        except:
+            questions = [q.strip("-• ") for q in raw.splitlines() if q.strip()]
+
+        questions = [q for q in questions if len(q) > 5]
+
+        if not questions:
+            st.error("❌ No valid questions generated.")
             st.stop()
 
-    # Clamp scores
-    def clamp(x): 
-        try: 
-            return max(0, min(10, int(x))) 
-        except: 
-            return 0
-    technical = clamp(result.get("technical", 0))
-    english = clamp(result.get("english", 0))
-    confidence = clamp(result.get("confidence", 0))
-    avg_score = round((technical + english + confidence) / 3, 1)
+        sess_row = {
+            "user_id": st.session_state["user"].get("id"),
+            "resume_id": st.session_state.get("current_resume_id"),
+            "questions": questions
+        }
+        try:
+            supabase.table("mock_sessions").insert(sess_row).execute()
+        except:
+            pass
 
-    # ---- Results UI ----
-    st.subheader("Scores")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Technical", technical)
-    c2.metric("English", english)
-    c3.metric("Confidence", confidence)
-    c4.metric("Average", avg_score)
+        st.session_state["current_questions"] = questions
+        st.success("✅ Questions generated successfully!")
+    except Exception as e:
+        st.error(f"Error: {e}")
+    finally:
+        stop_loading_quotes(stop_flag, t, ph, spinner)
 
-    st.subheader("Feedback")
-    st.write(result.get("feedback", "—"))
+# --- Answer & Feedback ---
+if st.session_state.get("current_questions"):
+    st.markdown("---")
+    st.subheader("🗣️ Answer the following questions:")
 
-    st.subheader("Improvement Plan")
-    st.write(result.get("improvement_plan", "—"))
+    questions = st.session_state["current_questions"]
+    for idx, q in enumerate(questions):
+        st.write(f"**Q{idx+1}:** {q}")
+        st.text_area(f"Your Answer for Q{idx+1}", key=f"ans_{idx}")
 
-    # ---- Perfect Answer ----
-    with st.spinner("Generating a model answer..."):
-        pa_prompt = f"Give the perfect interview answer for this question:\n\n{question}\n\nKeep it concise (4–6 sentences)."
-        pa_resp = model.generate_content(pa_prompt)
-        perfect_answer = pa_resp.text
+    if st.button("📤 Submit & Get Feedback"):
+        answers = [st.session_state.get(f"ans_{i}", "") for i in range(len(questions))]
+        if not any(answers):
+            st.warning("⚠️ Please answer at least one question before submitting.")
+            st.stop()
 
-    st.subheader("📌 Perfect Answer")
-    st.write(perfect_answer)
+        feedback_all = []
+        st.subheader("🧾 Feedback Summary")
+        progress = st.progress(0)
+
+        for i, (q, a) in enumerate(zip(questions, answers)):
+            progress.progress((i + 1) / len(questions))
+            is_behavioral = q.lower().startswith("behavioral")
+
+            if is_behavioral:
+                score_prompt = f"""
+                Evaluate this behavioral answer:
+                Q: {q}
+                A: {a}
+                Return JSON:
+                {{
+                    "communication": int,
+                    "emotional_intelligence": int,
+                    "confidence": int,
+                    "feedback": "..."
+                }}
+                """
+            else:
+                score_prompt = f"""
+                Evaluate this technical answer:
+                Q: {q}
+                A: {a}
+                Return JSON:
+                {{
+                    "technical": int,
+                    "clarity": int,
+                    "confidence": int,
+                    "feedback": "..."
+                }}
+                """
+
+            stop_flag, t, ph, spinner = show_loading_quotes(f"🧩 Evaluating Q{i+1}...")
+            try:
+                sresp = model.generate_content(score_prompt)
+                raw_fb = sresp.text.strip()
+                if raw_fb.startswith("```"):
+                    raw_fb = raw_fb.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(raw_fb)
+            except:
+                parsed = {"feedback": "Could not parse feedback."}
+            finally:
+                stop_loading_quotes(stop_flag, t, ph, spinner)
+
+            feedback_all.append(parsed)
+
+        st.success("✅ Feedback generated successfully!")
+        for i, fb in enumerate(feedback_all):
+            st.markdown(f"### 💬 Q{i+1} Feedback")
+            for k, v in fb.items():
+                if k != "feedback":
+                    st.write(f"**{k.capitalize()}:** {v}/10")
+            st.write(f"**Feedback:** {fb.get('feedback', '')}")
